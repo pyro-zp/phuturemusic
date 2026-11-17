@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DM-2 style drum prototype · v5</title>
+<style>
+  :root{
+    --bg:#0f0e0d; --panel:#1a1816; --line:#2a2724;
+    --text:#ece3d4; --muted:#8a8073; --accent:#e2603f;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; min-height:100vh; padding:32px 20px 60px;
+    background:radial-gradient(circle at 50% 0%, #201d1a 0%, var(--bg) 60%);
+    color:var(--text);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    display:flex; flex-direction:column; align-items:center;
+  }
+  h1{font-size:15px;font-weight:600;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}
+  .sub{font-size:12px;color:#5e564c;margin:0 0 24px;text-align:center;max-width:660px;line-height:1.55}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;width:100%;max-width:720px}
+  .pad{
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:16px 12px 12px;cursor:pointer;position:relative;overflow:hidden;
+    user-select:none;transition:transform .06s,border-color .15s,background .15s;
+  }
+  .pad:hover{border-color:#3a3530}
+  .pad:active,.pad.hit{transform:scale(.97);background:#24211d}
+  .pad::before{content:'';position:absolute;top:0;left:0;width:100%;height:3px;background:var(--c,var(--accent))}
+  .pad .name{font-size:13px;font-weight:600;letter-spacing:.02em}
+  .pad .key{font-size:10px;color:var(--muted);margin-top:4px;letter-spacing:.12em}
+  .pad .tag{position:absolute;top:6px;right:8px;font-size:9px;letter-spacing:.1em;opacity:.7}
+  .transport{margin-top:26px;display:flex;align-items:center;gap:22px;flex-wrap:wrap;justify-content:center}
+  button{
+    font-family:inherit;font-size:12px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:10px 18px;cursor:pointer;transition:background .15s,border-color .15s;
+  }
+  button:hover{background:#24211d;border-color:#3a3530}
+  .knob{display:flex;flex-direction:column;gap:4px;font-size:10px;color:var(--muted);letter-spacing:.1em}
+  .knob .row{display:flex;align-items:center;gap:10px}
+  .knob .val{color:var(--text);font-size:11px;min-width:40px;text-align:right;letter-spacing:.02em}
+  input[type=range]{-webkit-appearance:none;appearance:none;width:130px;height:4px;background:var(--line);border-radius:2px;outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--accent);cursor:pointer}
+  input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:var(--accent);cursor:pointer;border:none}
+  .playhead{display:grid;grid-template-columns:repeat(16,1fr);gap:4px;width:100%;max-width:720px;margin-top:22px}
+  .playhead div{height:5px;background:var(--line);border-radius:2px;transition:background .06s}
+  .playhead div.on{background:var(--accent)}
+  .hint{margin-top:22px;font-size:11px;color:#4a443c;letter-spacing:.06em;text-align:center;line-height:1.7;max-width:660px}
+  @media(max-width:560px){.grid{grid-template-columns:repeat(3,1fr)}}
+</style>
+</head>
+<body>
+  <h1>DM-2 style drum synth · v5</h1>
+  <p class="sub">Два слоя на голос. У каждого — источники, фильтр с огибающей (открытие / закрытие / горб) и амп-огибающая. PHAT = микс слоя 2. Cymbal — отдельный инструмент.</p>
+  <div class="grid" id="grid"></div>
+
+  <div class="transport">
+    <button id="demoBtn">▶ Demo beat</button>
+    <div class="knob"><div class="row"><span>VOL</span><input type="range" id="vol" min="0" max="100" value="55"><span class="val" id="volVal">55</span></div></div>
+    <div class="knob"><div class="row"><span>PHAT</span><input type="range" id="phat" min="0" max="200" value="100"><span class="val" id="phatVal">100%</span></div></div>
+  </div>
+
+  <div class="playhead" id="playhead"></div>
+  <p class="hint">Клавиши: 1 2 3 4 · Q W E R · A S D F &nbsp;|&nbsp; Space — demo &nbsp;|&nbsp; PHAT=0 — только слой 1 (тело), PHAT=200 — слой 2 (атака/шум)</p>
+
+<script>
+(() => {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  let ctx = null, master = null;
+  let whiteBuf = null, pinkBuf = null;
+  let masterVolume = 0.55;
+  let phatAmount = 1.0;
+
+  // ---------- NOISE BUFFERS ----------
+  function makeWhiteBuffer(c, seconds) {
+    const len = Math.floor(c.sampleRate * seconds);
+    const buf = c.createBuffer(1, len, c.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    return buf;
+  }
+
+  // Paul Kellet approximation of pink noise (-3 dB/oct)
+  function makePinkBuffer(c, seconds) {
+    const len = Math.floor(c.sampleRate * seconds);
+    const buf = c.createBuffer(1, len, c.sampleRate);
+    const d = buf.getChannelData(0);
+    let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
+    for (let i = 0; i < len; i++) {
+      const w = Math.random() * 2 - 1;
+      b0 = 0.99886*b0 + w*0.0555179;
+      b1 = 0.99332*b1 + w*0.0750759;
+      b2 = 0.96900*b2 + w*0.1538520;
+      b3 = 0.86650*b3 + w*0.3104856;
+      b4 = 0.55000*b4 + w*0.5329522;
+      b5 = -0.7616*b5 - w*0.0168980;
+      d[i] = (b0+b1+b2+b3+b4+b5+b6+w*0.5362)*0.11;
+      b6 = w*0.115926;
+    }
+    return buf;
+  }
+
+  function init() {
+    if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return ctx; }
+    ctx = new AudioCtx();
+    whiteBuf = makeWhiteBuffer(ctx, 2);
+    pinkBuf  = makePinkBuffer(ctx, 2);
+    master = ctx.createGain();
+    master.gain.value = masterVolume;
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -4;
+    limiter.knee.value = 0;
+    limiter.ratio.value = 20;
+    limiter.attack.value = 0.001;
+    limiter.release.value = 0.08;
+    master.connect(limiter);
+    limiter.connect(ctx.destination);
+    return ctx;
+  }
+
+  function driveCurve(amount) {
+    const n = 2048, c = new Float32Array(n);
+    const k = amount * 14;
+    if (k < 0.001) { for (let i = 0; i < n; i++) c[i] = (i / (n - 1)) * 2 - 1; return c; }
+    const norm = Math.tanh(k);
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * 2 - 1;
+      c[i] = Math.tanh(k * x) / norm;
+    }
+    return c;
+  }
+
+  // ---------- ENVELOPES ----------
+  function envLength(env) {
+    if (!env) return 0.2;
+    if (env.curve === 'clap') {
+      const bursts = env.bursts ?? 4, spacing = env.spacing ?? 0.012, tail = env.tail ?? 0.12;
+      let t = 0;
+      for (let i = 0; i < bursts; i++) t += spacing * (1 + i * 0.18);
+      return t + 0.01 + tail;
+    }
+    return (env.attack ?? 0.001) + (env.decay ?? 0.2) + 0.01;
+  }
+
+  function applyEnv(param, t0, env, peak) {
+    env = env || {};
+    const a = Math.max(env.attack ?? 0.001, 0.0004);
+    const d = Math.max(env.decay ?? 0.2, 0.005);
+    param.cancelScheduledValues(t0);
+    param.setValueAtTime(0, t0);
+    if (env.curve === 'clap') {
+      const bursts = env.bursts ?? 4, spacing = env.spacing ?? 0.012, tail = env.tail ?? 0.12;
+      let t = t0;
+      for (let i = 0; i < bursts; i++) {
+        const amp = peak * (1 - i * 0.07);
+        param.linearRampToValueAtTime(amp, t + 0.0006);
+        param.linearRampToValueAtTime(amp * 0.14, t + spacing * 0.9);
+        t += spacing * (1 + i * 0.18);
+      }
+      param.linearRampToValueAtTime(peak * 0.5, t + 0.003);
+      param.exponentialRampToValueAtTime(0.0001, t + 0.003 + tail);
+      param.setValueAtTime(0, t + 0.004 + tail);
+      return;
+    }
+    if (env.curve === 'lin') {
+      param.linearRampToValueAtTime(peak, t0 + a);
+      param.linearRampToValueAtTime(0, t0 + a + d);
+      return;
+    }
+    param.linearRampToValueAtTime(peak, t0 + a);
+    param.exponentialRampToValueAtTime(0.0001, t0 + a + d);
+    param.setValueAtTime(0, t0 + a + d + 0.001);
+  }
+
+  // ---------- OSC ----------
+  function spawnOsc(c, o, t0, stopAt, dest) {
+    if (o.fm) {
+      const carrier = c.createOscillator();
+      carrier.type = o.wave || 'sine';
+      carrier.frequency.setValueAtTime(o.f0, t0);
+      if (o.f1 !== undefined && o.pitchDecay) {
+        carrier.frequency.exponentialRampToValueAtTime(Math.max(o.f1, 5), t0 + o.pitchDecay);
+      }
+      const mod = c.createOscillator();
+      mod.type = o.fm.wave || 'sine';
+      mod.frequency.setValueAtTime(o.f0 * (o.fm.ratio || 1.5), t0);
+      const modGain = c.createGain();
+      const depthHz = (o.fm.amount ?? 1.5) * o.f0;
+      applyEnv(modGain.gain, t0, o.fm.env || { attack: 0.001, decay: 0.1 }, depthHz);
+      mod.connect(modGain);
+      modGain.connect(carrier.frequency);
+      const og = c.createGain();
+      og.gain.value = o.level ?? 1;
+      carrier.connect(og); og.connect(dest);
+      carrier.start(t0); mod.start(t0);
+      carrier.stop(stopAt); mod.stop(stopAt);
+      return;
+    }
+    const wave = o.wave || 'sine';
+    const baseFreq = o.f0 ?? 200;
+    const endFreq = o.f1;
+    const pDecay = o.pitchDecay ?? 0;
+    const level = o.level ?? 1;
+    const detuneBase = o.detune ?? 0;
+    const spread = o.spread ?? 0;
+    const stereo = !!o.stereo;
+
+    function makeOne(detuneCents, levelMul, panVal, startOffset) {
+      const osc = c.createOscillator();
+      osc.type = wave;
+      osc.frequency.setValueAtTime(baseFreq, t0);
+      if (endFreq !== undefined && pDecay > 0) {
+        osc.frequency.exponentialRampToValueAtTime(Math.max(endFreq, 5), t0 + pDecay);
+      }
+      osc.detune.value = detuneBase + detuneCents;
+      const g = c.createGain();
+      g.gain.value = level * levelMul;
+      osc.connect(g);
+      let node = g;
+      if (panVal !== 0) {
+        const p = c.createStereoPanner();
+        p.pan.value = panVal;
+        g.connect(p);
+        node = p;
+      }
+      node.connect(dest);
+      osc.start(t0 + startOffset);
+      osc.stop(stopAt + startOffset);
+    }
+
+    if (spread > 0.5) {
+      const off1 = Math.random() * 0.0005;
+      const off2 = Math.random() * 0.0005;
+      const pan = stereo ? 0.3 : 0;
+      makeOne(-spread * 0.5, 0.62, -pan, off1);
+      makeOne(+spread * 0.5, 0.62, +pan, off2);
+    } else {
+      makeOne(0, 1, 0, Math.random() * 0.0004);
+    }
+  }
+
+  function spawnNoise(c, level, t0, stopAt, dest, color) {
+    const src = c.createBufferSource();
+    src.buffer = color === 'pink' ? pinkBuf : whiteBuf;
+    src.loop = true;
+    const g = c.createGain();
+    g.gain.value = level;
+    src.connect(g);
+    g.connect(dest);
+    src.start(t0, Math.random() * 1.8);
+    src.stop(stopAt);
+  }
+
+  // ---------- LAYER ----------
+  function playLayer(c, layer, mix, t0, velocity, dest) {
+    const peak = (layer.level ?? 1) * velocity * mix;
+    if (peak < 0.001) return;
+    const stopAt = t0 + envLength(layer.env) + 0.1;
+
+    const sum = c.createGain();
+    sum.gain.value = 1;
+
+    (layer.oscs || []).forEach(o => spawnOsc(c, o, t0, stopAt, sum));
+    if (layer.noise && layer.noise > 0.01) {
+      spawnNoise(c, layer.noise, t0, stopAt, sum, layer.noiseColor || 'white');
+    }
+
+    let node = sum;
+
+    // ---- FILTER (supports: constant, one-way sweep, or "hump" with peak) ----
+    if (layer.filter) {
+      const f = c.createBiquadFilter();
+      f.type = layer.filter.type || 'lowpass';
+      f.Q.value = layer.filter.Q ?? 0.7;
+      const f0 = layer.filter.f0 ?? 1000;
+      const f1 = layer.filter.f1 ?? f0;
+      const pk = layer.filter.peak;
+      const fA = layer.filter.attack ?? 0.0008;
+      const fD = layer.filter.decay ?? 0;
+
+      f.frequency.setValueAtTime(f0, t0);
+
+      if (pk !== undefined && fD > 0) {
+        // hump: f0 → peak (short attack) → f1 (decay)
+        f.frequency.exponentialRampToValueAtTime(Math.max(pk, 10), t0 + fA);
+        f.frequency.exponentialRampToValueAtTime(Math.max(f1, 10), t0 + fA + fD);
+      } else if (f1 !== f0 && fD > 0) {
+        // one-way sweep (opening if f1>f0, closing if f1<f0)
+        f.frequency.exponentialRampToValueAtTime(Math.max(f1, 10), t0 + fD);
+      }
+      node.connect(f);
+      node = f;
+    }
+
+    const ampGain = c.createGain();
+    node.connect(ampGain);
+    applyEnv(ampGain.gain, t0, layer.env, peak);
+    ampGain.connect(dest);
+  }
+
+  function playVoice(preset, when, velocity, bus) {
+    const c = init();
+    const t0 = (when == null) ? c.currentTime : when;
+    const v = (velocity == null) ? 1 : velocity;
+    if (v <= 0.001) return;
+
+    const destBus = bus || master;
+    const out = c.createGain();
+    out.gain.value = 1;
+
+    if (preset.drive && preset.drive > 0.02) {
+      const ws = c.createWaveShaper();
+      ws.curve = driveCurve(preset.drive);
+      ws.oversample = '2x';
+      out.connect(ws);
+      ws.connect(destBus);
+    } else {
+      out.connect(destBus);
+    }
+
+    if (preset.l1) playLayer(c, preset.l1, 1.0, t0, v, out);
+    if (preset.l2) playLayer(c, preset.l2, phatAmount, t0, v, out);
+  }
+
+  // ---------- PRESETS ----------
+  // Хэты: 380 Hz, HPF 8500, короткие, шум белый.
+  // Cymbal: своя плотная база 300 Hz, HPF 4400, decay 1.4, шум с BPF-свипом.
+  const HAT_RATIOS = [2, 3, 4.16, 5.43, 6.79, 8.21, 9.87, 11.34];
+  const CYM_RATIOS = [2, 3, 4.16, 5.43, 6.79, 8.21, 9.87, 11.34, 13.21, 15.18];
+
+  const metalOscs = (base, ratios, lvl) => ratios.map(r => ({
+    wave: 'square', f0: base * r, level: lvl, spread: 6, stereo: true
+  }));
+
+  const PRESETS = [
+    // ---- 808 KICK: суб + битер 2×, нисходящий lowpass ----
+    {
+      id: 'kick808', name: '808 Kick', color: '#e2603f', drive: 0.12,
+      l1: {
+        level: 1,
+        oscs: [
+          { wave: 'sine',     f0: 130, f1: 47, pitchDecay: 0.055, level: 1 },
+          { wave: 'triangle', f0: 260, f1: 94, pitchDecay: 0.055, level: 0.22 }
+        ],
+        filter: { type: 'lowpass', f0: 4000, f1: 120, decay: 0.14, Q: 0.7 },
+        env: { attack: 0.001, decay: 0.8 }
+      },
+      l2: {
+        level: 0.20, noise: 0.5,
+        filter: { type: 'lowpass', f0: 3000, Q: 0.6 },
+        env: { attack: 0.0004, decay: 0.005 }
+      }
+    },
+    // ---- 909 KICK: треугольник + пила, агрессивнее ----
+    {
+      id: 'kick909', name: '909 Kick', color: '#d4552f', drive: 0.30,
+      l1: {
+        level: 1,
+        oscs: [
+          { wave: 'triangle', f0: 195, f1: 55, pitchDecay: 0.024, level: 1 },
+          { wave: 'sawtooth', f0: 390, f1: 110, pitchDecay: 0.024, level: 0.15 }
+        ],
+        filter: { type: 'lowpass', f0: 5000, f1: 100, decay: 0.12, Q: 0.7 },
+        env: { attack: 0.0006, decay: 0.34 }
+      },
+      l2: {
+        level: 0.40, noise: 0.85,
+        filter: { type: 'lowpass', f0: 3500, Q: 0.7 },
+        env: { attack: 0.0004, decay: 0.007 }
+      }
+    },
+    // ---- SNARE 808: тон с закрывающимся фильтром, шум с "горбом" ----
+    {
+      id: 'snare808', name: '808 Snare', color: '#c9a227', drive: 0.20,
+      l1: {
+        level: 1,
+        oscs: [
+          { wave: 'sine', f0: 95,  level: 0.22 },
+          { wave: 'sine', f0: 185, level: 0.85, spread: 14, stereo: true },
+          { wave: 'sine', f0: 330, level: 0.50, spread: 10, stereo: true }
+        ],
+        filter: { type: 'lowpass', f0: 5000, f1: 400, decay: 0.08, Q: 0.6 },
+        env: { attack: 0.0006, decay: 0.14 }
+      },
+      l2: {
+        level: 0.75, noise: 0.9,
+        // hump: 800 → 4000 (за 3 мс) → 1400 (за 200 мс)
+        filter: { type: 'bandpass', f0: 800, peak: 4000, attack: 0.003, f1: 1400, decay: 0.20, Q: 1.2 },
+        env: { attack: 0.0006, decay: 0.22 }
+      }
+    },
+    // ---- SNARE 909 ----
+    {
+      id: 'snare909', name: '909 Snare', color: '#b8942a', drive: 0.32,
+      l1: {
+        level: 1,
+        oscs: [
+          { wave: 'sine',     f0: 88,  level: 0.18 },
+          { wave: 'triangle', f0: 178, level: 0.82, spread: 12, stereo: true },
+          { wave: 'triangle', f0: 262, level: 0.50, spread: 8,  stereo: true }
+        ],
+        filter: { type: 'bandpass', f0: 1200, f1: 500, decay: 0.08, Q: 1.1 },
+        env: { attack: 0.0006, decay: 0.11 }
+      },
+      l2: {
+        level: 0.92, noise: 0.95,
+        filter: { type: 'bandpass', f0: 2600, Q: 0.9 },
+        env: { attack: 0.0006, decay: 0.22 }
+      }
+    },
+    // ---- CLAP ----
+    {
+      id: 'clap', name: 'Clap', color: '#8e7cc3', drive: 0.22,
+      l1: {
+        level: 0.4,
+        oscs: [{ wave: 'sine', f0: 175, level: 0.4, spread: 8 }],
+        env: { attack: 0.001, decay: 0.07 }
+      },
+      l2: {
+        level: 0.9, noise: 1.0,
+        filter: { type: 'bandpass', f0: 1250, Q: 1.6 },
+        env: { attack: 0.0004, curve: 'clap', bursts: 4, spacing: 0.011, tail: 0.14 }
+      }
+    },
+    // ---- HATS ----
+    {
+      id: 'hatClosed', name: 'Closed Hat', color: '#5aa9c9', drive: 0.10,
+      l1: {
+        level: 0.75,
+        oscs: metalOscs(380, HAT_RATIOS.slice(0, 6), 0.14),
+        filter: { type: 'highpass', f0: 8500, Q: 1.3 },
+        env: { attack: 0.0003, decay: 0.045 }
+      },
+      l2: {
+        level: 0.55, noise: 0.9,
+        filter: { type: 'highpass', f0: 9500, Q: 0.7 },
+        env: { attack: 0.0003, decay: 0.035 }
+      }
+    },
+    {
+      id: 'hatOpen', name: 'Open Hat', color: '#4f96b3', drive: 0.10,
+      l1: {
+        level: 0.75,
+        oscs: metalOscs(380, HAT_RATIOS.slice(0, 6), 0.14),
+        filter: { type: 'highpass', f0: 8300, Q: 1.2 },
+        env: { attack: 0.0003, decay: 0.42 }
+      },
+      l2: {
+        level: 0.55, noise: 0.9,
+        filter: { type: 'highpass', f0: 9200, Q: 0.7 },
+        env: { attack: 0.0003, decay: 0.36 }
+      }
+    },
+    // ---- CYMBAL (отдельный инструмент) ----
+    {
+      id: 'cymbal', name: 'Cymbal', color: '#3a6f8c', drive: 0.12,
+      l1: {
+        level: 0.7,
+        // Плотная низкая база 300 Hz → больше «тела», меньше «цыканья»
+        oscs: metalOscs(300, CYM_RATIOS, 0.09),
+        filter: { type: 'highpass', f0: 4400, Q: 0.9 },
+        env: { attack: 0.0003, decay: 1.4 }
+      },
+      l2: {
+        level: 0.45, noise: 0.85,
+        // BPF-свип: 8000 → 2500 за 0.9 с — характерный «shing»
+        filter: { type: 'bandpass', f0: 8000, f1: 2500, decay: 0.9, Q: 1.1 },
+        env: { attack: 0.0004, decay: 1.2 }
+      }
+    },
+    // ---- TOM (нисходящий фильтр) ----
+    {
+      id: 'tom', name: 'Tom', color: '#6aa84f', drive: 0.14,
+      l1: {
+        level: 1,
+        oscs: [{ wave: 'sine', f0: 220, f1: 92, pitchDecay: 0.09, level: 1, spread: 6 }],
+        filter: { type: 'lowpass', f0: 4000, f1: 180, decay: 0.15, Q: 0.8 },
+        env: { attack: 0.0008, decay: 0.45 }
+      },
+      l2: {
+        level: 0.25, noise: 0.35, noiseColor: 'pink',
+        filter: { type: 'lowpass', f0: 3500, Q: 0.6 },
+        env: { attack: 0.0004, decay: 0.014 }
+      }
+    },
+    // ---- RIM (нисходящий bandpass) ----
+    {
+      id: 'rim', name: 'Rim', color: '#c96a4f', drive: 0.28,
+      l1: {
+        level: 1,
+        oscs: [
+          { wave: 'square', f0: 1700, level: 0.55, spread: 10 },
+          { wave: 'square', f0: 470,  level: 0.50, spread: 14 }
+        ],
+        filter: { type: 'bandpass', f0: 6000, f1: 800, decay: 0.03, Q: 3.5 },
+        env: { attack: 0.0004, decay: 0.035 }
+      }
+    },
+    // ---- COWBELL (квинта 540 : 810 = 1.5) ----
+    {
+      id: 'cowbell', name: 'Cowbell', color: '#b0762e', drive: 0.20,
+      l1: {
+        level: 0.85,
+        oscs: [
+          { wave: 'square', f0: 540, level: 0.55, spread: 5, stereo: true },
+          { wave: 'square', f0: 810, level: 0.55, spread: 5, stereo: true }
+        ],
+        filter: { type: 'bandpass', f0: 780, Q: 1.8 },
+        env: { attack: 0.0005, decay: 0.42, curve: 'lin' }
+      },
+      l2: {
+        level: 0.12, noise: 0.35, noiseColor: 'pink',
+        filter: { type: 'bandpass', f0: 1400, Q: 2 },
+        env: { attack: 0.0004, decay: 0.008 }
+      }
+    },
+    // ---- ZAP (нисходящий lowpass, уже был) ----
+    {
+      id: 'zap', name: 'Zap', color: '#9c5b8e', drive: 0.35,
+      l1: {
+        level: 0.85,
+        oscs: [{ wave: 'sawtooth', f0: 2400, f1: 40, pitchDecay: 0.16, level: 1, spread: 20, stereo: true }],
+        filter: { type: 'lowpass', f0: 6000, f1: 320, decay: 0.18, Q: 2 },
+        env: { attack: 0.001, decay: 0.2 }
+      }
+    }
+  ];
+
+  // ---------- UI ----------
+  const grid = document.getElementById('grid');
+  const playheadEl = document.getElementById('playhead');
+  const demoBtn = document.getElementById('demoBtn');
+  const volSlider = document.getElementById('vol');
+  const volVal    = document.getElementById('volVal');
+  const phatSlider = document.getElementById('phat');
+  const phatVal    = document.getElementById('phatVal');
+
+  const pads = [];
+  const KEYS = ['1','2','3','4','q','w','e','r','a','s','d','f'];
+
+  PRESETS.forEach((p, i) => {
+    const el = document.createElement('div');
+    el.className = 'pad';
+    el.style.setProperty('--c', p.color);
+    const tag = p.l2 ? '2L' : '1L';
+    el.innerHTML = `<div class="name">${p.name}</div><div class="key">${KEYS[i].toUpperCase()}</div><div class="tag">${tag}</div>`;
+    el.addEventListener('pointerdown', () => triggerPad(i));
+    grid.appendChild(el);
+    pads.push(el);
+  });
+
+  function triggerPad(i, when, vel) {
+    init();
+    playVoice(PRESETS[i], when, vel ?? 1);
+    const el = pads[i];
+    el.classList.add('hit');
+    clearTimeout(el._t);
+    el._t = setTimeout(() => el.classList.remove('hit'), 90);
+  }
+
+  const cells = [];
+  for (let i = 0; i < 16; i++) {
+    const d = document.createElement('div');
+    playheadEl.appendChild(d);
+    cells.push(d);
+  }
+
+  volSlider.addEventListener('input', e => {
+    masterVolume = e.target.value / 100;
+    volVal.textContent = e.target.value;
+    if (master) master.gain.setTargetAtTime(masterVolume, ctx.currentTime, 0.02);
+  });
+
+  phatSlider.addEventListener('input', e => {
+    phatAmount = e.target.value / 100;
+    phatVal.textContent = e.target.value + '%';
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.repeat) return;
+    if (e.key === ' ') { e.preventDefault(); toggleDemo(); return; }
+    const idx = KEYS.indexOf(e.key.toLowerCase());
+    if (idx >= 0 && idx < PRESETS.length) { e.preventDefault(); triggerPad(idx); }
+  });
+
+  // ---- DEMO ----
+  const DEMO = {
+    bpm: 122, repeats: 4,
+    pattern: {
+      0:  [['kick909', 1.0], ['hatClosed', 0.5]],
+      1:  [],
+      2:  [['hatClosed', 0.5]],
+      3:  [['cymbal', 0.2]],
+      4:  [['kick909', 0.95], ['clap', 0.9]],
+      5:  [],
+      6:  [['hatClosed', 0.5]],
+      7:  [['snare808', 0.85]],
+      8:  [['kick909', 1.0], ['hatClosed', 0.5]],
+      9:  [],
+      10: [['hatClosed', 0.5]],
+      11: [['cymbal', 0.2]],
+      12: [['kick909', 0.95], ['snare909', 0.95]],
+      13: [],
+      14: [['hatOpen', 0.6]],
+      15: [['hatClosed', 0.3], ['cowbell', 0.5]]
+    }
+  };
+
+  let demoPlaying = false, demoAnimId = null;
+  let demoStart = 0, demoStepDur = 0, demoTotal = 0, demoBus = null;
+
+  function toggleDemo() { demoPlaying ? stopDemo() : startDemo(); }
+  demoBtn.addEventListener('click', toggleDemo);
+
+  function startDemo() {
+    const c = init();
+    stopDemo(true);
+    demoStepDur = 60 / DEMO.bpm / 4;
+    demoTotal = 16 * DEMO.repeats;
+    demoStart = c.currentTime + 0.08;
+    demoBus = c.createGain();
+    demoBus.gain.value = 1;
+    demoBus.connect(master);
+    for (let i = 0; i < demoTotal; i++) {
+      const s = i % 16;
+      const t = demoStart + i * demoStepDur;
+      const evts = DEMO.pattern[s] || [];
+      for (const ev of evts) {
+        const preset = PRESETS.find(p => p.id === ev[0]);
+        if (preset) playVoice(preset, t, ev[1], demoBus);
+      }
+    }
+    demoPlaying = true;
+    demoBtn.textContent = '■ Stop';
+    tick();
+  }
+
+  function tick() {
+    if (!demoPlaying) return;
+    const elapsed = ctx.currentTime - demoStart;
+    if (elapsed >= demoTotal * demoStepDur) { stopDemo(); return; }
+    const step = elapsed < 0 ? -1 : Math.floor(elapsed / demoStepDur) % 16;
+    for (let i = 0; i < 16; i++) cells[i].classList.toggle('on', i === step);
+    demoAnimId = requestAnimationFrame(tick);
+  }
+
+  function stopDemo(keepLabel) {
+    demoPlaying = false;
+    if (demoAnimId) cancelAnimationFrame(demoAnimId);
+    demoAnimId = null;
+    cells.forEach(c => c.classList.remove('on'));
+    if (demoBus) { try { demoBus.disconnect(); } catch(e){} demoBus = null; }
+    if (!keepLabel) demoBtn.textContent = '▶ Demo beat';
+  }
+})();
+</script>
+</body>
+</html>
